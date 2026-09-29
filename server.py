@@ -264,13 +264,18 @@ async def sales_by_item(
     include_credit_notes: bool = True,
 ) -> dict[str, Any]:
     """
-    Aggregate Zoho Books sales by SKU/item for a date range.
+    Fast Zoho Books Sales by Item report.
 
-    Returns gross quantity/value from non-void invoices and, when requested,
-    subtracts credit-note quantities/values to produce net quantity and net sales.
-    Useful for questions such as "most selling SKU this month".
+    Uses Zoho's native Sales by Item report endpoint, so it does NOT fetch
+    hundreds/thousands of invoices one-by-one. Suitable for month, year,
+    and Top-100 SKU queries.
 
     sort_by: net_quantity, net_sales, gross_quantity, gross_sales
+
+    Note: Zoho's native Sales by Item report is used as the source of truth.
+    The report's quantity_sold and amount values are returned as the net report
+    values for the selected period. include_credit_notes is retained for
+    backward compatibility but the native report determines the final figures.
     """
     if not date_start or not date_end:
         raise ValueError("date_start and date_end are required in YYYY-MM-DD format")
@@ -279,126 +284,58 @@ async def sales_by_item(
     if sort_by not in allowed_sort:
         raise ValueError(f"sort_by must be one of: {', '.join(sorted(allowed_sort))}")
 
-    # 1) Fetch all invoices in the requested date range.
-    invoices = await _paged_zoho_get(
-        "invoices",
-        {"date_start": date_start, "date_end": date_end},
-    )
-    invoices = [x for x in invoices if x.get("status") != "void" and x.get("invoice_id")]
+    top_n = max(1, min(int(top_n), 500))
 
-    invoice_details = await _get_many_details(
-        "invoices",
-        [str(x["invoice_id"]) for x in invoices],
-        concurrency=3,
+    # Zoho Books native Sales by Item report endpoint.
+    payload = await _zoho_get(
+        "reports/salesbyitem",
+        {
+            "from_date": date_start,
+            "to_date": date_end,
+        },
     )
 
-    agg: dict[str, dict[str, Any]] = defaultdict(
-        lambda: {
-            "sku": "",
-            "item_id": "",
-            "item_name": "",
-            "gross_quantity": 0.0,
-            "gross_sales": 0.0,
-            "return_quantity": 0.0,
-            "return_value": 0.0,
-            "invoice_count": 0,
-            "credit_note_count": 0,
-        }
-    )
+    sales = payload.get("sales") or []
+    rows: list[dict[str, Any]] = []
 
-    def add_lines(lines: list[dict[str, Any]], is_return: bool, seen: set[str]) -> None:
-        for li in lines or []:
-            sku = str(li.get("sku") or "").strip()
-            item_id = str(li.get("item_id") or "").strip()
-            key = sku or (f"ITEM:{item_id}" if item_id else str(li.get("name") or li.get("item_name") or "UNKNOWN"))
-            name = str(li.get("name") or li.get("item_name") or "").strip()
-            quantity = float(li.get("quantity") or 0)
+    for entry in sales:
+        item_meta = entry.get("item") or {}
+        quantity = float(entry.get("quantity_sold") or 0)
+        amount = float(entry.get("amount") or 0)
 
-            amount = li.get("item_total")
-            if amount is None:
-                amount = li.get("line_item_total")
-            if amount is None:
-                amount = li.get("total")
-            if amount is None:
-                amount = float(li.get("rate") or 0) * quantity
-            amount = float(amount or 0)
-
-            row = agg[key]
-            row["sku"] = sku
-            row["item_id"] = item_id
-            row["item_name"] = name
-
-            if is_return:
-                row["return_quantity"] += quantity
-                row["return_value"] += amount
-            else:
-                row["gross_quantity"] += quantity
-                row["gross_sales"] += amount
-            seen.add(key)
-
-    invoice_detail_errors = 0
-    for payload in invoice_details:
-        if not payload:
-            invoice_detail_errors += 1
-            continue
-        inv = payload.get("invoice") or payload
-        seen: set[str] = set()
-        add_lines(inv.get("line_items") or [], False, seen)
-        for key in seen:
-            agg[key]["invoice_count"] += 1
-
-    # 2) Optionally subtract credit-note line items for net sales/quantity.
-    credit_note_detail_errors = 0
-    credit_notes: list[dict[str, Any]] = []
-    if include_credit_notes:
-        # Zoho's credit-note list endpoint does not consistently expose date-range
-        # query params, so page through and filter locally by date.
-        all_credit_notes = await _paged_zoho_get("creditnotes", {"sort_column": "date"})
-        credit_notes = [
-            x for x in all_credit_notes
-            if x.get("status") != "void"
-            and date_start <= str(x.get("date") or "") <= date_end
-            and x.get("creditnote_id")
-        ]
-
-        credit_details = await _get_many_details(
-            "creditnotes",
-            [str(x["creditnote_id"]) for x in credit_notes],
-            concurrency=3,
+        rows.append(
+            {
+                "sku": str(item_meta.get("sku") or "").strip(),
+                "item_id": str(entry.get("item_id") or "").strip(),
+                "item_name": str(entry.get("item_name") or "").strip(),
+                "category_name": str(entry.get("category_name") or "").strip(),
+                "group_name": str(entry.get("group_name") or "").strip(),
+                "unit": str(entry.get("unit") or "").strip(),
+                "gross_quantity": round(quantity, 3),
+                "gross_sales": round(amount, 2),
+                "return_quantity": 0.0,
+                "return_value": 0.0,
+                "net_quantity": round(quantity, 3),
+                "net_sales": round(amount, 2),
+                "average_price": round(float(entry.get("average_price") or 0), 2),
+            }
         )
 
-        for payload in credit_details:
-            if not payload:
-                credit_note_detail_errors += 1
-                continue
-            cn = payload.get("creditnote") or payload
-            seen: set[str] = set()
-            add_lines(cn.get("line_items") or [], True, seen)
-            for key in seen:
-                agg[key]["credit_note_count"] += 1
+    sort_key = {
+        "net_quantity": "net_quantity",
+        "net_sales": "net_sales",
+        "gross_quantity": "gross_quantity",
+        "gross_sales": "gross_sales",
+    }[sort_by]
 
-    rows: list[dict[str, Any]] = []
-    for row in agg.values():
-        row["gross_quantity"] = round(row["gross_quantity"], 3)
-        row["gross_sales"] = round(row["gross_sales"], 2)
-        row["return_quantity"] = round(row["return_quantity"], 3)
-        row["return_value"] = round(row["return_value"], 2)
-        row["net_quantity"] = round(row["gross_quantity"] - row["return_quantity"], 3)
-        row["net_sales"] = round(row["gross_sales"] - row["return_value"], 2)
-        rows.append(row)
-
-    rows.sort(key=lambda x: float(x.get(sort_by) or 0), reverse=True)
-    top_n = max(1, min(int(top_n), 200))
+    rows.sort(key=lambda x: float(x.get(sort_key) or 0), reverse=True)
 
     return {
         "date_start": date_start,
         "date_end": date_end,
+        "source": "Zoho Books native Sales by Item report",
         "sort_by": sort_by,
-        "include_credit_notes": include_credit_notes,
-        "invoice_count": len(invoices),
-        "credit_note_count": len(credit_notes),
-        "invoice_detail_errors": invoice_detail_errors,
-        "credit_note_detail_errors": credit_note_detail_errors,
+        "include_credit_notes_requested": include_credit_notes,
         "items_count": len(rows),
         "items": rows[:top_n],
     }
