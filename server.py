@@ -1,216 +1,96 @@
-                amount = float(li.get("rate") or 0) * quantity
-            amount = float(amount or 0)
+import os
+import time
+import asyncio
+from collections import defaultdict
+from typing import Any
 
-            row = agg[key]
-            row["sku"] = sku
-            row["item_id"] = item_id
-            row["item_name"] = name
+import httpx
+from mcp.server import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 
-            if is_return:
-                row["return_quantity"] += quantity
-                row["return_value"] += amount
-            else:
-                row["gross_quantity"] += quantity
-                row["gross_sales"] += amount
-            seen.add(key)
+SERVER_NAME = "Zoho Books Reports"
+ZOHO_DC = os.getenv("ZOHO_DC", "in")
+ZOHO_ORG_ID = os.getenv("ZOHO_ORG_ID", "")
+ZOHO_CLIENT_ID = os.getenv("ZOHO_CLIENT_ID", "")
+ZOHO_CLIENT_SECRET = os.getenv("ZOHO_CLIENT_SECRET", "")
+ZOHO_REFRESH_TOKEN = os.getenv("ZOHO_REFRESH_TOKEN", "")
+ALLOWED_HOST = os.getenv("ALLOWED_HOST", "localhost")
 
-    invoice_detail_errors = 0
-    for payload in invoice_details:
-        if not payload:
-            invoice_detail_errors += 1
-            continue
-        inv = payload.get("invoice") or payload
-        seen: set[str] = set()
-        add_lines(inv.get("line_items") or [], False, seen)
-        for key in seen:
-            agg[key]["invoice_count"] += 1
+API_BASE = f"https://www.zohoapis.{ZOHO_DC}/books/v3"
+ACCOUNTS_BASE = f"https://accounts.zoho.{ZOHO_DC}/oauth/v2/token"
 
-    # 2) Optionally subtract credit-note line items for net sales/quantity.
-    credit_note_detail_errors = 0
-    credit_notes: list[dict[str, Any]] = []
-    if include_credit_notes:
-        # Zoho's credit-note list endpoint does not consistently expose date-range
-        # query params, so page through and filter locally by date.
-        all_credit_notes = await _paged_zoho_get("creditnotes", {"sort_column": "date"})
-        credit_notes = [
-            x for x in all_credit_notes
-            if x.get("status") != "void"
-            and date_start <= str(x.get("date") or "") <= date_end
-            and x.get("creditnote_id")
-        ]
+mcp = MCPServer(
+    SERVER_NAME,
+    instructions=(
+        "Read-only Zoho Books reporting connector. Never creates, updates, or deletes data. "
+        "Use organization_id from environment by default unless explicitly supplied."
+    ),
+)
 
-        credit_details = await _get_many_details(
-            "creditnotes",
-            [str(x["creditnote_id"]) for x in credit_notes],
-            concurrency=20,
+_access_token: str | None = None
+_token_expires_at = 0.0
+
+
+def _require_env() -> None:
+    missing = [
+        k for k, v in {
+            "ZOHO_ORG_ID": ZOHO_ORG_ID,
+            "ZOHO_CLIENT_ID": ZOHO_CLIENT_ID,
+            "ZOHO_CLIENT_SECRET": ZOHO_CLIENT_SECRET,
+            "ZOHO_REFRESH_TOKEN": ZOHO_REFRESH_TOKEN,
+        }.items() if not v
+    ]
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+
+
+async def _get_access_token() -> str:
+    global _access_token, _token_expires_at
+    _require_env()
+    if _access_token and time.time() < _token_expires_at - 60:
+        return _access_token
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            ACCOUNTS_BASE,
+            data={
+                "refresh_token": ZOHO_REFRESH_TOKEN,
+                "client_id": ZOHO_CLIENT_ID,
+                "client_secret": ZOHO_CLIENT_SECRET,
+                "grant_type": "refresh_token",
+            },
         )
-
-        for payload in credit_details:
-            if not payload:
-                credit_note_detail_errors += 1
-                continue
-            cn = payload.get("creditnote") or payload
-            seen: set[str] = set()
-            add_lines(cn.get("line_items") or [], True, seen)
-            for key in seen:
-                agg[key]["credit_note_count"] += 1
-
-    rows: list[dict[str, Any]] = []
-    for row in agg.values():
-        row["gross_quantity"] = round(row["gross_quantity"], 3)
-        row["gross_sales"] = round(row["gross_sales"], 2)
-        row["return_quantity"] = round(row["return_quantity"], 3)
-        row["return_value"] = round(row["return_value"], 2)
-        row["net_quantity"] = round(row["gross_quantity"] - row["return_quantity"], 3)
-        row["net_sales"] = round(row["gross_sales"] - row["return_value"], 2)
-        rows.append(row)
-
-    rows.sort(key=lambda x: float(x.get(sort_by) or 0), reverse=True)
-    top_n = max(1, min(int(top_n), 200))
-
-    return {
-        "date_start": date_start,
-        "date_end": date_end,
-        "sort_by": sort_by,
-        "include_credit_notes": include_credit_notes,
-        "invoice_count": len(invoices),
-        "credit_note_count": len(credit_notes),
-        "invoice_detail_errors": invoice_detail_errors,
-        "credit_note_detail_errors": credit_note_detail_errors,
-        "items_count": len(rows),
-        "items": rows[:top_n],
-    }
+        response.raise_for_status()
+        payload = response.json()
+        if "access_token" not in payload:
+            raise RuntimeError(f"Zoho token refresh failed: {payload}")
+        _access_token = payload["access_token"]
+        _token_expires_at = time.time() + int(payload.get("expires_in", 3600))
+        return _access_token
 
 
-@mcp.tool()
-async def zoho_books_read(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    """
-    Advanced read-only Zoho Books GET tool for endpoints not yet wrapped above.
-    Pass a relative Books v3 path such as 'reports/...' or 'items'.
-    This tool never sends POST/PUT/PATCH/DELETE requests.
-    """
-    if not path or path.startswith("/"):
-        path = path.lstrip("/")
-    blocked = ("settings/preferences",)
-    if any(path.startswith(x) for x in blocked):
-        raise ValueError("This endpoint is blocked in the read-only connector")
-    return await _zoho_get(path, params)
-
-
-security = TransportSecuritySettings(
-    allowed_hosts=[ALLOWED_HOST, f"{ALLOWED_HOST}:*", "localhost", "localhost:*", "127.0.0.1", "127.0.0.1:*"],
-    allowed_origins=[f"https://{ALLOWED_HOST}", f"http://{ALLOWED_HOST}", "http://localhost", "http://127.0.0.1"],
-)
-
-app = mcp.streamable_http_app(
-    transport_security=security,
-    json_response=True,
-)
-                amount = float(li.get("rate") or 0) * quantity
-            amount = float(amount or 0)
-
-            row = agg[key]
-            row["sku"] = sku
-            row["item_id"] = item_id
-            row["item_name"] = name
-
-            if is_return:
-                row["return_quantity"] += quantity
-                row["return_value"] += amount
-            else:
-                row["gross_quantity"] += quantity
-                row["gross_sales"] += amount
-            seen.add(key)
-
-    invoice_detail_errors = 0
-    for payload in invoice_details:
-        if not payload:
-            invoice_detail_errors += 1
-            continue
-        inv = payload.get("invoice") or payload
-        seen: set[str] = set()
-        add_lines(inv.get("line_items") or [], False, seen)
-        for key in seen:
-            agg[key]["invoice_count"] += 1
-
-    # 2) Optionally subtract credit-note line items for net sales/quantity.
-    credit_note_detail_errors = 0
-    credit_notes: list[dict[str, Any]] = []
-    if include_credit_notes:
-        # Zoho's credit-note list endpoint does not consistently expose date-range
-        # query params, so page through and filter locally by date.
-        all_credit_notes = await _paged_zoho_get("creditnotes", {"sort_column": "date"})
-        credit_notes = [
-            x for x in all_credit_notes
-            if x.get("status") != "void"
-            and date_start <= str(x.get("date") or "") <= date_end
-            and x.get("creditnote_id")
-        ]
-
-        credit_details = await _get_many_details(
-            "creditnotes",
-            [str(x["creditnote_id"]) for x in credit_notes],
-            concurrency=20,
+async def _zoho_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    token = await _get_access_token()
+    clean_path = path.lstrip("/")
+    if clean_path.startswith("http://") or clean_path.startswith("https://"):
+        raise ValueError("Only relative Zoho Books API paths are allowed")
+    url = f"{API_BASE}/{clean_path}"
+    q = dict(params or {})
+    q.setdefault("organization_id", ZOHO_ORG_ID)
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.get(
+            url,
+            params=q,
+            headers={"Authorization": f"Zoho-oauthtoken {token}"},
         )
+        response.raise_for_status()
+        return response.json()
 
-        for payload in credit_details:
-            if not payload:
-                credit_note_detail_errors += 1
-                continue
-            cn = payload.get("creditnote") or payload
-            seen: set[str] = set()
-            add_lines(cn.get("line_items") or [], True, seen)
-            for key in seen:
-                agg[key]["credit_note_count"] += 1
 
+async def _paged_zoho_get(path: str, params: dict[str, Any] | None = None, per_page: int = 200) -> list[dict[str, Any]]:
+    """Fetch all pages from a standard Zoho Books list endpoint."""
     rows: list[dict[str, Any]] = []
-    for row in agg.values():
-        row["gross_quantity"] = round(row["gross_quantity"], 3)
-        row["gross_sales"] = round(row["gross_sales"], 2)
-        row["return_quantity"] = round(row["return_quantity"], 3)
-        row["return_value"] = round(row["return_value"], 2)
-        row["net_quantity"] = round(row["gross_quantity"] - row["return_quantity"], 3)
-        row["net_sales"] = round(row["gross_sales"] - row["return_value"], 2)
-        rows.append(row)
-
-    rows.sort(key=lambda x: float(x.get(sort_by) or 0), reverse=True)
-    top_n = max(1, min(int(top_n), 200))
-
-    return {
-        "date_start": date_start,
-        "date_end": date_end,
-        "sort_by": sort_by,
-        "include_credit_notes": include_credit_notes,
-        "invoice_count": len(invoices),
-        "credit_note_count": len(credit_notes),
-        "invoice_detail_errors": invoice_detail_errors,
-        "credit_note_detail_errors": credit_note_detail_errors,
-        "items_count": len(rows),
-        "items": rows[:top_n],
-    }
-
-
-@mcp.tool()
-async def zoho_books_read(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    """
-    Advanced read-only Zoho Books GET tool for endpoints not yet wrapped above.
-    Pass a relative Books v3 path such as 'reports/...' or 'items'.
-    This tool never sends POST/PUT/PATCH/DELETE requests.
-    """
-    if not path or path.startswith("/"):
-        path = path.lstrip("/")
-    blocked = ("settings/preferences",)
-    if any(path.startswith(x) for x in blocked):
-        raise ValueError("This endpoint is blocked in the read-only connector")
-    return await _zoho_get(path, params)
-
-
-security = TransportSecuritySettings(
-    allowed_hosts=[ALLOWED_HOST, f"{ALLOWED_HOST}:*", "localhost", "localhost:*", "127.0.0.1", "127.0.0.1:*"],
-    allowed_origins=[f"https://{ALLOWED_HOST}", f"http://{ALLOWED_HOST}", "http://localhost", "http://127.0.0.1"],
-)
-
-app = mcp.streamable_http_app(
-    transport_security=security,
-    json_response=True,
-)
+    page = 1
+    base_params = dict(params or {})
+    while True:
+        q = dict(base_params)
