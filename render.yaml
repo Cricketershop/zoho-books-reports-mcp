@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: zoho-books-reports-mcp
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT --proxy-headers
+    healthCheckPath: /mcp
+    envVars:
+      - key: ZOHO_DC
+        value: in
+      - key: ZOHO_ORG_ID
+        sync: false
+      - key: ZOHO_CLIENT_ID
+        sync: false
+      - key: ZOHO_CLIENT_SECRET
+        sync: false
+      - key: ZOHO_REFRESH_TOKEN
+        sync: false
+      - key: ALLOWED_HOST
+        sync: false
