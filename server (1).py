@@ -1,0 +1,396 @@
+import os
+import time
+import asyncio
+from collections import defaultdict
+from typing import Any
+
+import httpx
+from mcp.server import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
+
+SERVER_NAME = "Zoho Books Reports"
+ZOHO_DC = os.getenv("ZOHO_DC", "in")
+ZOHO_ORG_ID = os.getenv("ZOHO_ORG_ID", "")
+ZOHO_CLIENT_ID = os.getenv("ZOHO_CLIENT_ID", "")
+ZOHO_CLIENT_SECRET = os.getenv("ZOHO_CLIENT_SECRET", "")
+ZOHO_REFRESH_TOKEN = os.getenv("ZOHO_REFRESH_TOKEN", "")
+ALLOWED_HOST = os.getenv("ALLOWED_HOST", "localhost")
+
+API_BASE = f"https://www.zohoapis.{ZOHO_DC}/books/v3"
+ACCOUNTS_BASE = f"https://accounts.zoho.{ZOHO_DC}/oauth/v2/token"
+
+mcp = MCPServer(
+    SERVER_NAME,
+    instructions=(
+        "Read-only Zoho Books reporting connector. Never creates, updates, or deletes data. "
+        "Use organization_id from environment by default unless explicitly supplied."
+    ),
+)
+
+_access_token: str | None = None
+_token_expires_at = 0.0
+
+
+def _require_env() -> None:
+    missing = [
+        k for k, v in {
+            "ZOHO_ORG_ID": ZOHO_ORG_ID,
+            "ZOHO_CLIENT_ID": ZOHO_CLIENT_ID,
+            "ZOHO_CLIENT_SECRET": ZOHO_CLIENT_SECRET,
+            "ZOHO_REFRESH_TOKEN": ZOHO_REFRESH_TOKEN,
+        }.items() if not v
+    ]
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+
+
+async def _get_access_token() -> str:
+    global _access_token, _token_expires_at
+    _require_env()
+    if _access_token and time.time() < _token_expires_at - 60:
+        return _access_token
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            ACCOUNTS_BASE,
+            data={
+                "refresh_token": ZOHO_REFRESH_TOKEN,
+                "client_id": ZOHO_CLIENT_ID,
+                "client_secret": ZOHO_CLIENT_SECRET,
+                "grant_type": "refresh_token",
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if "access_token" not in payload:
+            raise RuntimeError(f"Zoho token refresh failed: {payload}")
+        _access_token = payload["access_token"]
+        _token_expires_at = time.time() + int(payload.get("expires_in", 3600))
+        return _access_token
+
+
+async def _zoho_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    token = await _get_access_token()
+    clean_path = path.lstrip("/")
+    if clean_path.startswith("http://") or clean_path.startswith("https://"):
+        raise ValueError("Only relative Zoho Books API paths are allowed")
+    url = f"{API_BASE}/{clean_path}"
+    q = dict(params or {})
+    q.setdefault("organization_id", ZOHO_ORG_ID)
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.get(
+            url,
+            params=q,
+            headers={"Authorization": f"Zoho-oauthtoken {token}"},
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+async def _paged_zoho_get(path: str, params: dict[str, Any] | None = None, per_page: int = 200) -> list[dict[str, Any]]:
+    """Fetch all pages from a standard Zoho Books list endpoint."""
+    rows: list[dict[str, Any]] = []
+    page = 1
+    base_params = dict(params or {})
+    while True:
+        q = dict(base_params)
+        q["page"] = page
+        q["per_page"] = per_page
+        payload = await _zoho_get(path, q)
+
+        # Find the first top-level list field (e.g. invoices, creditnotes).
+        batch: list[dict[str, Any]] = []
+        for value in payload.values():
+            if isinstance(value, list):
+                batch = value
+                break
+        rows.extend(batch)
+
+        page_context = payload.get("page_context") or {}
+        if not page_context.get("has_more_page"):
+            break
+        page += 1
+    return rows
+
+
+async def _get_many_details(path_prefix: str, ids: list[str], concurrency: int = 20) -> list[dict[str, Any]]:
+    """Fetch record details concurrently while staying gentle on Zoho API."""
+    token = await _get_access_token()
+    semaphore = asyncio.Semaphore(max(1, min(concurrency, 30)))
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        async def fetch(record_id: str) -> dict[str, Any] | None:
+            async with semaphore:
+                url = f"{API_BASE}/{path_prefix}/{record_id}"
+                try:
+                    response = await client.get(
+                        url,
+                        params={"organization_id": ZOHO_ORG_ID},
+                        headers={"Authorization": f"Zoho-oauthtoken {token}"},
+                    )
+                    response.raise_for_status()
+                    return response.json()
+                except Exception:
+                    return None
+
+        return await asyncio.gather(*(fetch(record_id) for record_id in ids))
+
+
+@mcp.tool()
+async def health() -> dict[str, Any]:
+    """Check whether the server has the required Zoho configuration."""
+    return {
+        "ok": True,
+        "server": SERVER_NAME,
+        "zoho_dc": ZOHO_DC,
+        "organization_id_configured": bool(ZOHO_ORG_ID),
+    }
+
+
+@mcp.tool()
+async def list_organizations() -> dict[str, Any]:
+    """List Zoho Books organizations accessible to the configured Zoho account."""
+    token = await _get_access_token()
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(
+            f"{API_BASE}/organizations",
+            headers={"Authorization": f"Zoho-oauthtoken {token}"},
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+@mcp.tool()
+async def list_invoices(date_start: str | None = None, date_end: str | None = None, page: int = 1, per_page: int = 200) -> dict[str, Any]:
+    """List invoices, optionally filtered by invoice date range (YYYY-MM-DD)."""
+    params: dict[str, Any] = {"page": page, "per_page": per_page}
+    if date_start:
+        params["date_start"] = date_start
+    if date_end:
+        params["date_end"] = date_end
+    return await _zoho_get("invoices", params)
+
+
+@mcp.tool()
+async def list_credit_notes(page: int = 1, per_page: int = 200, status: str | None = None) -> dict[str, Any]:
+    """List credit notes. Filter by status when needed."""
+    params: dict[str, Any] = {"page": page, "per_page": per_page}
+    if status:
+        params["status"] = status
+    return await _zoho_get("creditnotes", params)
+
+
+@mcp.tool()
+async def list_customer_payments(page: int = 1, per_page: int = 200) -> dict[str, Any]:
+    """List customer payments."""
+    return await _zoho_get("customerpayments", {"page": page, "per_page": per_page})
+
+
+@mcp.tool()
+async def list_contacts(page: int = 1, per_page: int = 200, contact_type: str | None = None) -> dict[str, Any]:
+    """List contacts/customers/vendors."""
+    params: dict[str, Any] = {"page": page, "per_page": per_page}
+    if contact_type:
+        params["contact_type"] = contact_type
+    return await _zoho_get("contacts", params)
+
+
+@mcp.tool()
+async def list_items(page: int = 1, per_page: int = 200, search_text: str | None = None) -> dict[str, Any]:
+    """List Zoho Books items and current item metadata."""
+    params: dict[str, Any] = {"page": page, "per_page": per_page}
+    if search_text:
+        params["search_text"] = search_text
+    return await _zoho_get("items", params)
+
+
+@mcp.tool()
+async def list_sales_orders(page: int = 1, per_page: int = 200) -> dict[str, Any]:
+    """List sales orders."""
+    return await _zoho_get("salesorders", {"page": page, "per_page": per_page})
+
+
+@mcp.tool()
+async def list_sales_receipts(page: int = 1, per_page: int = 200, date_start: str | None = None, date_end: str | None = None) -> dict[str, Any]:
+    """List sales receipts, optionally filtered by date range."""
+    params: dict[str, Any] = {"page": page, "per_page": per_page}
+    if date_start:
+        params["date_start"] = date_start
+    if date_end:
+        params["date_end"] = date_end
+    return await _zoho_get("salesreceipts", params)
+
+
+@mcp.tool()
+async def sales_by_item(
+    date_start: str,
+    date_end: str,
+    top_n: int = 25,
+    sort_by: str = "net_quantity",
+    include_credit_notes: bool = True,
+) -> dict[str, Any]:
+    """
+    Aggregate Zoho Books sales by SKU/item for a date range.
+
+    Returns gross quantity/value from non-void invoices and, when requested,
+    subtracts credit-note quantities/values to produce net quantity and net sales.
+    Useful for questions such as "most selling SKU this month".
+
+    sort_by: net_quantity, net_sales, gross_quantity, gross_sales
+    """
+    if not date_start or not date_end:
+        raise ValueError("date_start and date_end are required in YYYY-MM-DD format")
+
+    allowed_sort = {"net_quantity", "net_sales", "gross_quantity", "gross_sales"}
+    if sort_by not in allowed_sort:
+        raise ValueError(f"sort_by must be one of: {', '.join(sorted(allowed_sort))}")
+
+    # 1) Fetch all invoices in the requested date range.
+    invoices = await _paged_zoho_get(
+        "invoices",
+        {"date_start": date_start, "date_end": date_end},
+    )
+    invoices = [x for x in invoices if x.get("status") != "void" and x.get("invoice_id")]
+
+    invoice_details = await _get_many_details(
+        "invoices",
+        [str(x["invoice_id"]) for x in invoices],
+        concurrency=20,
+    )
+
+    agg: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "sku": "",
+            "item_id": "",
+            "item_name": "",
+            "gross_quantity": 0.0,
+            "gross_sales": 0.0,
+            "return_quantity": 0.0,
+            "return_value": 0.0,
+            "invoice_count": 0,
+            "credit_note_count": 0,
+        }
+    )
+
+    def add_lines(lines: list[dict[str, Any]], is_return: bool, seen: set[str]) -> None:
+        for li in lines or []:
+            sku = str(li.get("sku") or "").strip()
+            item_id = str(li.get("item_id") or "").strip()
+            key = sku or (f"ITEM:{item_id}" if item_id else str(li.get("name") or li.get("item_name") or "UNKNOWN"))
+            name = str(li.get("name") or li.get("item_name") or "").strip()
+            quantity = float(li.get("quantity") or 0)
+
+            amount = li.get("item_total")
+            if amount is None:
+                amount = li.get("line_item_total")
+            if amount is None:
+                amount = li.get("total")
+            if amount is None:
+                amount = float(li.get("rate") or 0) * quantity
+            amount = float(amount or 0)
+
+            row = agg[key]
+            row["sku"] = sku
+            row["item_id"] = item_id
+            row["item_name"] = name
+
+            if is_return:
+                row["return_quantity"] += quantity
+                row["return_value"] += amount
+            else:
+                row["gross_quantity"] += quantity
+                row["gross_sales"] += amount
+            seen.add(key)
+
+    invoice_detail_errors = 0
+    for payload in invoice_details:
+        if not payload:
+            invoice_detail_errors += 1
+            continue
+        inv = payload.get("invoice") or payload
+        seen: set[str] = set()
+        add_lines(inv.get("line_items") or [], False, seen)
+        for key in seen:
+            agg[key]["invoice_count"] += 1
+
+    # 2) Optionally subtract credit-note line items for net sales/quantity.
+    credit_note_detail_errors = 0
+    credit_notes: list[dict[str, Any]] = []
+    if include_credit_notes:
+        # Zoho's credit-note list endpoint does not consistently expose date-range
+        # query params, so page through and filter locally by date.
+        all_credit_notes = await _paged_zoho_get("creditnotes", {"sort_column": "date"})
+        credit_notes = [
+            x for x in all_credit_notes
+            if x.get("status") != "void"
+            and date_start <= str(x.get("date") or "") <= date_end
+            and x.get("creditnote_id")
+        ]
+
+        credit_details = await _get_many_details(
+            "creditnotes",
+            [str(x["creditnote_id"]) for x in credit_notes],
+            concurrency=20,
+        )
+
+        for payload in credit_details:
+            if not payload:
+                credit_note_detail_errors += 1
+                continue
+            cn = payload.get("creditnote") or payload
+            seen: set[str] = set()
+            add_lines(cn.get("line_items") or [], True, seen)
+            for key in seen:
+                agg[key]["credit_note_count"] += 1
+
+    rows: list[dict[str, Any]] = []
+    for row in agg.values():
+        row["gross_quantity"] = round(row["gross_quantity"], 3)
+        row["gross_sales"] = round(row["gross_sales"], 2)
+        row["return_quantity"] = round(row["return_quantity"], 3)
+        row["return_value"] = round(row["return_value"], 2)
+        row["net_quantity"] = round(row["gross_quantity"] - row["return_quantity"], 3)
+        row["net_sales"] = round(row["gross_sales"] - row["return_value"], 2)
+        rows.append(row)
+
+    rows.sort(key=lambda x: float(x.get(sort_by) or 0), reverse=True)
+    top_n = max(1, min(int(top_n), 200))
+
+    return {
+        "date_start": date_start,
+        "date_end": date_end,
+        "sort_by": sort_by,
+        "include_credit_notes": include_credit_notes,
+        "invoice_count": len(invoices),
+        "credit_note_count": len(credit_notes),
+        "invoice_detail_errors": invoice_detail_errors,
+        "credit_note_detail_errors": credit_note_detail_errors,
+        "items_count": len(rows),
+        "items": rows[:top_n],
+    }
+
+
+@mcp.tool()
+async def zoho_books_read(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    """
+    Advanced read-only Zoho Books GET tool for endpoints not yet wrapped above.
+    Pass a relative Books v3 path such as 'reports/...' or 'items'.
+    This tool never sends POST/PUT/PATCH/DELETE requests.
+    """
+    if not path or path.startswith("/"):
+        path = path.lstrip("/")
+    blocked = ("settings/preferences",)
+    if any(path.startswith(x) for x in blocked):
+        raise ValueError("This endpoint is blocked in the read-only connector")
+    return await _zoho_get(path, params)
+
+
+security = TransportSecuritySettings(
+    allowed_hosts=[ALLOWED_HOST, f"{ALLOWED_HOST}:*", "localhost", "localhost:*", "127.0.0.1", "127.0.0.1:*"],
+    allowed_origins=[f"https://{ALLOWED_HOST}", f"http://{ALLOWED_HOST}", "http://localhost", "http://127.0.0.1"],
+)
+
+app = mcp.streamable_http_app(
+    transport_security=security,
+    json_response=True,
+)
