@@ -354,7 +354,27 @@ async def zoho_books_read(path: str, params: dict[str, Any] | None = None) -> di
     if any(path.startswith(x) for x in blocked):
         raise ValueError("This endpoint is blocked in the read-only connector")
     return await _zoho_get(path, params)
+@mcp.tool()
+async def list_warehouses() -> dict[str, Any]:
+    """
+    List all Zoho Books locations/warehouses.
+    Useful for finding the warehouse/location ID,
+    for example Amazon FBA MH.
+    """
+    return await _zoho_get("locations", None)
 
+
+@mcp.tool()
+async def warehouse_stock(
+    warehouse_id: str,
+) -> dict[str, Any]:
+    """
+    Get inventory stock for a specific Zoho Books warehouse/location.
+    """
+    return await _zoho_get(
+        "reports/inventorysummary",
+        {"warehouse_id": warehouse_id},
+    )
 
 security = TransportSecuritySettings(
     allowed_hosts=[ALLOWED_HOST, f"{ALLOWED_HOST}:*", "localhost", "localhost:*", "127.0.0.1", "127.0.0.1:*"],
